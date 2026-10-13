@@ -3,7 +3,9 @@
 #   HCLOUD_TOKEN=... expect -f test/e2e.exp NAME DIR
 # Links that need a person are written to DIR (ts_url, claude_url, env_url). Approve them in a
 # browser; for the Claude sign-in, save the code the page shows to DIR/claude_code and the run
-# goes on. Skips GitHub. The full transcript is DIR/up.log. Tear down after: deskless down NAME
+# goes on. With GITHUB=1 it also signs in to GitHub: enter DIR/gh_code at
+# https://github.com/login/device. The full transcript is DIR/up.log. Tear down after:
+# deskless down NAME
 set name [lindex $argv 0]
 set dir [lindex $argv 1]
 set timeout -1
@@ -27,7 +29,15 @@ expect {
     }
     exp_continue
   }
-  -re {Sign the box in to GitHub\? \[Y/n\]} { send "n\r"; exp_continue }
+  -re {Sign the box in to GitHub\? \[Y/n\]} {
+    if {[info exists env(GITHUB)] && $env(GITHUB) == 1} { send "y\r" } else { send "n\r" }
+    exp_continue
+  }
+  -re {Authenticate Git with your GitHub credentials\?.*?\x1b\[6n} {
+    send "\033\[50;400R"; after 500; send "Y\r"; exp_continue
+  }
+  -re {one-time code: ([A-Z0-9]{4}-[A-Z0-9]{4})} { save "$dir/gh_code" $expect_out(1,string); exp_continue }
+  -re {Press Enter to open [^\r\n]*} { send "\r"; exp_continue }
   -re {Run it in the foreground once more[^\r\n]*\[y/N\]} { send "n\r"; exp_continue }
   -re {Ready\? \[Y/n\]} { send "\r"; exp_continue }
   -re {Trust /home/[^\r\n]*\?} { after 500; send "y\r"; exp_continue }
@@ -39,6 +49,9 @@ expect {
     exp_continue
   }
   -re {again to (exit|quit|stop)} { after 500; send "\003"; exp_continue }
+  # gh's prompts ask the terminal where the cursor is; a real terminal answers by itself. Last,
+  # because a match swallows everything before it in the output, prompts included.
+  -re {\x1b\[6n} { send "\033\[50;400R"; exp_continue }
   eof
 }
 catch wait result

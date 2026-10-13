@@ -258,7 +258,8 @@ step_github() {
   say "GitHub (optional), so Claude can clone, push and open PRs"
   if ! as_user 'gh auth status' >/dev/null 2>&1; then
     ask "Sign the box in to GitHub?" y || return 0
-    info "gh prints a one-time code: open github.com/login/device on any device and enter it."
+    info "gh asks whether to authenticate Git too: answer Y. Then it shows a one-time code;"
+    info "enter it at github.com/login/device on any device, and come back here."
     as_user 'gh auth login --hostname github.com --git-protocol https --web' </dev/tty || true
     as_user 'gh auth status' >/dev/null 2>&1 || { warn "GitHub sign-in didn't finish; re-run the script to try again."; return 0; }
   fi
