@@ -4,7 +4,7 @@ Your own always-on Claude Code server, driven from the Claude app on your phone 
 claude.ai/code. One command creates it on Hetzner, and one command deletes it.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/katyella/deskless/main/deskless && chmod +x deskless
+curl -fsSLO https://raw.githubusercontent.com/katyella/deskless/v1/deskless && chmod +x deskless
 export HCLOUD_TOKEN=...       # Hetzner Console > your project > Security > API tokens (Read & Write)
 ./deskless up mybox         # create the server and set it up
 ./deskless down mybox       # sign it out of everything and delete it
@@ -39,7 +39,7 @@ Switching it off doesn't.
 3. Creates an `agent` user with no sudo and installs Claude Code for it.
 4. Writes a guardrail `settings.json` and a starter `CLAUDE.md` in `~/work`.
 5. Puts the box on your tailnet. Set `TAILSCALE_AUTHKEY` to skip the browser approval.
-6. Asks you to sign in to Claude, and optionally GitHub.
+6. Asks you to sign in to Claude, and optionally GitHub. When gh asks to authenticate Git, answer Y.
 7. Runs Remote Control once in the foreground: answer `y` twice, press space for a QR code, scan
    it, then press Ctrl-C.
 8. Installs `remote-control.service`, then checks that your laptop can SSH over Tailscale. Only if it
@@ -51,6 +51,23 @@ Options: `--type`, `--location`, `--image`, `--ssh-key`, `--no-tailscale`, and
 `--permission-mode` (default `dontAsk`). See `./deskless --help`.
 
 Already have a server? Copy the script to it and run `sudo bash deskless setup`.
+
+## Let an agent do it
+
+`skills/deskless` is a skill for Claude Code. With it installed, you can ask, for example, "make me a
+deskless box called mybox". The agent runs `up`, passes you each link or code that needs you,
+and takes back the Claude sign-in code. It can also list your boxes and, once you've said yes,
+delete one.
+
+```bash
+mkdir -p ~/.claude/skills/deskless && cd ~/.claude/skills/deskless && curl -fsSL \
+  -O https://raw.githubusercontent.com/katyella/deskless/v1/skills/deskless/SKILL.md \
+  -O https://raw.githubusercontent.com/katyella/deskless/v1/skills/deskless/drive.exp \
+  -O https://raw.githubusercontent.com/katyella/deskless/v1/deskless && chmod +x deskless drive.exp
+```
+
+Other agents can follow the same instructions: `SKILL.md` is plain Markdown, and `drive.exp`
+needs only `expect`, which is built into macOS.
 
 ## What Claude can and can't do on the box
 
@@ -96,8 +113,8 @@ tailnet after 180 days.
 
 - `bash test/api-test.sh` runs `up`, `down` and `list` against a local mock of the Hetzner API.
   Nothing real is created.
-- `test/e2e.exp` drives a real `up`, answering its prompts. The links that need you are written
-  to a folder; see its header.
+- `skills/deskless/drive.exp` drives a real `up`, answering its prompts. The links and codes that
+  need you are written to a folder; see its header. `GITHUB=1` includes the GitHub sign-in.
 
 ## License
 

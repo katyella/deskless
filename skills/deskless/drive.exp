@@ -1,18 +1,26 @@
 #!/usr/bin/expect -f
-# End-to-end run on a real Hetzner server: drives `deskless up NAME` and answers its prompts.
-#   HCLOUD_TOKEN=... expect -f test/e2e.exp NAME DIR
-# Links that need a person are written to DIR (ts_url, claude_url, env_url). Approve them in a
-# browser; for the Claude sign-in, save the code the page shows to DIR/claude_code and the run
-# goes on. With GITHUB=1 it also signs in to GitHub: enter DIR/gh_code at
-# https://github.com/login/device. The full transcript is DIR/up.log. Tear down after:
-# deskless down NAME
+# Drives `deskless up NAME` for an agent: answers the script's own prompts and hands everything
+# that needs a person to files in DIR, one at a time.
+#   HCLOUD_TOKEN=... [GITHUB=1] expect -f drive.exp NAME DIR [up options]
+#   DIR/ts_url       a Tailscale link for the person to approve
+#   DIR/claude_url   a Claude sign-in link; write the code the page shows to DIR/claude_code
+#   DIR/gh_code      a one-time code for https://github.com/login/device (only with GITHUB=1)
+#   DIR/env_url      the box's Remote Control link, once it's connected
+#   DIR/exit         the exit status of `up`, written last; DIR/up.log has the whole transcript
+# Finds deskless in $DESKLESS, next to this file, or two folders up (the repo layout).
 set name [lindex $argv 0]
 set dir [lindex $argv 1]
 set timeout -1
 file mkdir $dir
 log_file -a "$dir/up.log"
 set env(LC_ALL) en_US.UTF-8
-spawn [file dirname [file normalize [info script]]]/../deskless up $name
+set here [file dirname [file normalize [info script]]]
+set deskless ""
+foreach candidate [list [expr {[info exists env(DESKLESS)] ? $env(DESKLESS) : ""}] $here/deskless $here/../../deskless] {
+  if {$candidate ne "" && [file executable $candidate]} { set deskless $candidate; break }
+}
+if {$deskless eq ""} { puts stderr "Can't find the deskless script; set DESKLESS"; exit 2 }
+spawn $deskless up $name {*}[lrange $argv 2 end]
 # A wide terminal, so long sign-in links are never wrapped.
 catch {exec stty rows 50 columns 400 < $spawn_out(slave,name)}
 set got_claude 0
