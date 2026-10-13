@@ -1,0 +1,46 @@
+#!/usr/bin/expect -f
+# End-to-end run on a real Hetzner server: drives `deskless up NAME` and answers its prompts.
+#   HCLOUD_TOKEN=... expect -f test/e2e.exp NAME DIR
+# Links that need a person are written to DIR (ts_url, claude_url, env_url). Approve them in a
+# browser; for the Claude sign-in, save the code the page shows to DIR/claude_code and the run
+# goes on. Skips GitHub. The full transcript is DIR/up.log. Tear down after: deskless down NAME
+set name [lindex $argv 0]
+set dir [lindex $argv 1]
+set timeout -1
+file mkdir $dir
+log_file -a "$dir/up.log"
+set env(LC_ALL) en_US.UTF-8
+spawn [file dirname [file normalize [info script]]]/../deskless up $name
+# A wide terminal, so long sign-in links are never wrapped.
+catch {exec stty rows 50 columns 400 < $spawn_out(slave,name)}
+set got_claude 0
+set sent_ctrl_c 0
+proc save {path text} { set f [open $path w]; puts $f $text; close $f }
+expect {
+  -re {(https://login\.tailscale\.com/a/[A-Za-z0-9]+)} { save "$dir/ts_url" $expect_out(1,string); exp_continue }
+  -re {(https://[^\s\x1b\x07"]*oauth/authorize[^\s\x1b\x07"]*)} {
+    if {!$got_claude} {
+      set got_claude 1
+      save "$dir/claude_url" $expect_out(1,string)
+      while {![file exists "$dir/claude_code"]} { after 2000 }
+      send -- "[string trim [exec cat $dir/claude_code]]\r"
+    }
+    exp_continue
+  }
+  -re {Sign the box in to GitHub\? \[Y/n\]} { send "n\r"; exp_continue }
+  -re {Run it in the foreground once more[^\r\n]*\[y/N\]} { send "n\r"; exp_continue }
+  -re {Ready\? \[Y/n\]} { send "\r"; exp_continue }
+  -re {Trust /home/[^\r\n]*\?} { after 500; send "y\r"; exp_continue }
+  -re {Enable Remote Control\?} { after 500; send "y\r"; exp_continue }
+  -re {(https://claude\.ai/code\?environment=[A-Za-z0-9_]+)} {
+    save "$dir/env_url" $expect_out(1,string)
+    # Connected: hand over to the background service, as a person would with Ctrl-C.
+    if {!$sent_ctrl_c} { set sent_ctrl_c 1; after 6000; send "\003" }
+    exp_continue
+  }
+  -re {again to (exit|quit|stop)} { after 500; send "\003"; exp_continue }
+  eof
+}
+catch wait result
+save "$dir/exit" [lindex $result 3]
+exit [lindex $result 3]

@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+# deskless: Claude Code on your own Hetzner server, driven from the Claude app (iOS, Android)
+# and claude.ai/code. https://github.com/katyella/deskless (MIT). Run it from your laptop:
+#
+#   export HCLOUD_TOKEN=...      # Hetzner Console > your project > Security > API tokens (Read & Write)
+#   ./deskless up mybox        # create the server and set it up (you approve a few sign-ins)
+#   ./deskless down mybox      # sign it out of Claude, GitHub and Tailscale, then delete it
+#   ./deskless list            # the boxes this script made
+#
+# Already have a server? Copy this file to it and run:  sudo bash deskless setup
+#
+# Needs a Claude Pro, Max, Team or Enterprise login: Remote Control does not work with API keys.
+# Safe to re-run: `up` on an existing box re-runs setup, and setup keeps whatever is already there.
+# The laptop side sticks to bash 3.2, which is what macOS ships.
+set -euo pipefail
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '\033[33m!!  %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31mxx  %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Prompts read the terminal, not stdin, which may be a pipe.
+ask() {
+  local hint ans
+  if [ "$2" = y ]; then hint='[Y/n]'; else hint='[y/N]'; fi
+  printf '%s %s ' "$1" "$hint" >/dev/tty
+  read -r ans </dev/tty || ans=
+  [[ ${ans:-$2} =~ ^[Yy] ]]
+}
+
+as_user() { runuser -l "$BOX_USER" -c "$1"; }
+
+usage() {
+  cat <<'EOF'
+From your laptop (needs HCLOUD_TOKEN, an API token from your Hetzner project; set
+TAILSCALE_AUTHKEY too and the box joins your tailnet without a browser approval):
+  ./deskless up NAME [--type cx23] [--location hel1] [--image ubuntu-24.04]
+                       [--ssh-key ~/.ssh/id_ed25519.pub] [setup options]
+  ./deskless down NAME [--yes]
+  ./deskless list
+
+On a server you already have, as root:
+  bash deskless setup [--name NAME] [setup options]
+
+Setup options:
+  --no-tailscale            skip Tailscale (on by default); SSH stays open on the public IP
+  --permission-mode MODE    starting mode for sessions: dontAsk (default), acceptEdits, auto, default, plan
+  --user USER               the account Claude Code runs as (default: agent, no sudo)
+EOF
+}
+
+parse_setup_args() {
+  BOX_NAME=${BOX_NAME:-}
+  TAILSCALE=${TAILSCALE:-yes}
+  LAPTOP_CLOSES_SSH=no
+  PERMISSION_MODE=${PERMISSION_MODE:-dontAsk}
+  BOX_USER=${BOX_USER:-agent}
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --name) BOX_NAME=${2:?--name needs a value}; shift 2 ;;
+      --tailscale) TAILSCALE=yes; shift ;;
+      --no-tailscale) TAILSCALE=no; shift ;;
+      --laptop-closes-ssh) LAPTOP_CLOSES_SSH=yes; shift ;;   # set by `up`, which tests the tailnet itself
+      --permission-mode) PERMISSION_MODE=${2:?--permission-mode needs a value}; shift 2 ;;
+      --user) BOX_USER=${2:?--user needs a value}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option $1 (try --help)" ;;
+    esac
+  done
+}
+
+preflight() {
+  [ "$(id -u)" -eq 0 ] || die "Run as root: sudo bash deskless setup"
+  local os
+  os=$(. /etc/os-release 2>/dev/null && echo "${ID:-}")
+  case $os in ubuntu|debian) ;; *) die "This script supports Ubuntu and Debian, not '${os:-unknown}'." ;; esac
+  command -v systemctl >/dev/null || die "systemd is required."
+  { : </dev/tty; } 2>/dev/null || die "No terminal. Run this from an interactive SSH session: the sign-in step needs you."
+
+  if [ -z "$BOX_NAME" ]; then
+    local def
+    def=$(hostname -s)
+    printf 'What should this box be called in the Claude app? [%s] ' "$def" >/dev/tty
+    read -r BOX_NAME </dev/tty || true
+    BOX_NAME=${BOX_NAME:-$def}
+  fi
+  # The name ends up inside a systemd ExecStart line, so keep it to plain characters.
+  [[ $BOX_NAME =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]{0,39}$ ]] \
+    || die "Box name '$BOX_NAME': use letters, digits, spaces, dots, dashes or underscores (40 max)."
+  [[ $BOX_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "User name '$BOX_USER' is not a valid Linux user name."
+  case $PERMISSION_MODE in
+    dontAsk|acceptEdits|auto|default|manual|plan|bypassPermissions) ;;
+    *) die "Unknown permission mode '$PERMISSION_MODE'." ;;
+  esac
+}
+
+step_packages() {
+  say "Updating packages and turning on automatic security updates"
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+  # On a brand-new server, cloud-init and the first automatic update may still hold apt.
+  if command -v cloud-init >/dev/null; then cloud-init status --wait >/dev/null 2>&1 || true; fi
+  local keep=(-o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  apt-get -o DPkg::Lock::Timeout=600 update -q
+  apt-get -yq "${keep[@]}" upgrade
+  apt-get -yq "${keep[@]}" install curl ca-certificates gh git jq ripgrep tmux ufw unattended-upgrades
+  cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+}
+
+step_swap() {
+  [ -z "$(swapon --show --noheadings)" ] || return 0
+  say "Adding 2 GB of swap so a busy session can't run the box out of memory"
+  [ -e /swapfile ] || { fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null; }
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >>/etc/fstab
+}
+
+step_user() {
+  say "Creating the '$BOX_USER' user, with no sudo"
+  if id "$BOX_USER" >/dev/null 2>&1; then
+    info "already there"
+  else
+    useradd --create-home --shell /bin/bash --comment "Claude Code" "$BOX_USER"
+  fi
+  if id -nG "$BOX_USER" | grep -qwE 'sudo|admin|wheel'; then
+    warn "'$BOX_USER' is in a sudo group, so its sessions could become root."
+  fi
+  usermod -aG systemd-journal "$BOX_USER"   # sessions can read service logs when debugging
+  BOX_HOME=$(getent passwd "$BOX_USER" | cut -d: -f6)
+  CLAUDE_BIN=$BOX_HOME/.local/bin/claude
+  WORK=$BOX_HOME/work
+}
+
+step_claude_code() {
+  say "Installing Claude Code for '$BOX_USER'"
+  if [ -x "$CLAUDE_BIN" ]; then
+    info "already installed: $(as_user "'$CLAUDE_BIN' --version")"
+  else
+    as_user 'curl -fsSL https://claude.ai/install.sh | bash'
+  fi
+  [ -x "$CLAUDE_BIN" ] || die "Claude Code did not land in $CLAUDE_BIN"
+}
+
+step_workspace() {
+  say "Writing guardrails and the workspace"
+  install -d -o "$BOX_USER" -g "$BOX_USER" -m 700 "$BOX_HOME/.claude"
+  install -d -o "$BOX_USER" -g "$BOX_USER" "$WORK"
+
+  local settings=$BOX_HOME/.claude/settings.json
+  if [ -e "$settings" ]; then
+    info "keeping your ~/.claude/settings.json"
+  else
+    # Sessions run without prompts, but can't touch the things that would lock you out
+    # (Tailscale, SSH, this service) or read the login token.
+    cat >"$settings" <<EOF
+{
+  "permissions": {
+    "defaultMode": "$PERMISSION_MODE",
+    "allow": ["Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Bash"],
+    "deny": [
+      "Bash(sudo *)", "Bash(* sudo *)", "Bash(su *)",
+      "Bash(git push --force*)", "Bash(git push -f*)", "Bash(git push * --force*)", "Bash(git push * -f*)",
+      "Bash(tailscale *)", "Bash(* tailscale *)",
+      "Bash(systemctl * tailscaled*)", "Bash(systemctl * ssh*)", "Bash(systemctl * remote-control*)",
+      "Bash(rm -rf /*)", "Bash(rm -rf ~)", "Bash(rm -rf ~/)",
+      "Read(~/.claude/.credentials.json)", "Edit(~/.claude/.credentials.json)", "Bash(* .credentials.json*)"
+    ]
+  }
+}
+EOF
+    chown "$BOX_USER:$BOX_USER" "$settings"
+  fi
+
+  if [ -e "$WORK/CLAUDE.md" ]; then
+    info "keeping your ~/work/CLAUDE.md"
+  else
+    cat >"$WORK/CLAUDE.md" <<EOF
+# $BOX_NAME
+
+You are Claude Code on an always-on server, running as the \`$BOX_USER\` user with no sudo.
+The owner drives you from the Claude app on their phone or from claude.ai/code, so keep
+replies short and say plainly when something needs them to act.
+
+- New sessions start in \`$WORK\`. Clone repositories under it.
+- If something needs root, say what and why; the owner will run it over SSH.
+- Never touch Tailscale, sshd, or \`remote-control.service\`: breaking them cuts off this session.
+- This box has a public IP. Bind anything you start to 127.0.0.1 or the Tailscale address.
+- Never commit secrets and never force-push.
+EOF
+    chown "$BOX_USER:$BOX_USER" "$WORK/CLAUDE.md"
+  fi
+}
+
+step_tailscale() {
+  TS_IP=
+  local key_file=/root/.deskless-tailscale-key key=''
+  if [ -s "$key_file" ]; then key=$(cat "$key_file"); fi
+  rm -f "$key_file"
+  [ "$TAILSCALE" = yes ] || return 0
+  say "Tailscale, so only your own devices can reach the box"
+  if command -v tailscale >/dev/null; then
+    info "installed: $(tailscale version | head -n 1)"
+  else
+    info "not on the box yet; installing"
+    curl -fsSL https://tailscale.com/install.sh | sh
+  fi
+  systemctl enable --now tailscaled >/dev/null 2>&1 || true
+  if tailscale ip -4 >/dev/null 2>&1; then
+    info "already connected"
+  else
+    local ts_host
+    ts_host=$(printf '%s' "$BOX_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')
+    if [ -n "$key" ]; then
+      info "connecting with the auth key from your laptop"
+      tailscale up --hostname "$ts_host" --auth-key "$key"
+    else
+      info "Open the link below on your laptop or phone and approve the box."
+      tailscale up --hostname "$ts_host" </dev/tty
+    fi
+  fi
+  TS_IP=$(tailscale ip -4 | head -n 1)
+  info "on your tailnet as $(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")') ($TS_IP)"
+  info "Turn off key expiry for this box in the Tailscale admin console, or it drops off in 180 days."
+}
+
+step_firewall() {
+  say "Firewall: nothing gets in but SSH (Remote Control only dials out)"
+  ufw default deny incoming >/dev/null
+  ufw default allow outgoing >/dev/null
+  ufw allow OpenSSH >/dev/null   # with Tailscale, closed at the end once you've tested the tailnet
+  [ "$TAILSCALE" = yes ] && ufw allow in on tailscale0 >/dev/null
+  ufw --force enable >/dev/null
+}
+
+step_login() {
+  say "Signing Claude Code in to your Claude account"
+  local status
+  status=$(as_user "'$CLAUDE_BIN' auth status" 2>/dev/null || true)
+  if grep -q '"loggedIn": *true' <<<"$status"; then
+    info "already signed in"
+  else
+    info "Open the link on any device, approve, then paste the code back here."
+    as_user "'$CLAUDE_BIN' auth login" </dev/tty || true
+    status=$(as_user "'$CLAUDE_BIN' auth status" 2>/dev/null || true)
+    grep -q '"loggedIn": *true' <<<"$status" || die "Sign-in didn't finish. Re-run the script to try again."
+  fi
+  local plan
+  plan=$(sed -n 's/.*"subscriptionType": *"\([^"]*\)".*/\1/p' <<<"$status")
+  case $plan in
+    pro|max|team|enterprise) info "plan: $plan" ;;
+    *) warn "Remote Control needs a Pro, Max, Team or Enterprise plan; this login reports '${plan:-none}'." ;;
+  esac
+}
+
+step_github() {
+  say "GitHub (optional), so Claude can clone, push and open PRs"
+  if ! as_user 'gh auth status' >/dev/null 2>&1; then
+    ask "Sign the box in to GitHub?" y || return 0
+    info "gh prints a one-time code: open github.com/login/device on any device and enter it."
+    as_user 'gh auth login --hostname github.com --git-protocol https --web' </dev/tty || true
+    as_user 'gh auth status' >/dev/null 2>&1 || { warn "GitHub sign-in didn't finish; re-run the script to try again."; return 0; }
+  fi
+  # git uses gh's token, and commits get the account's name and no-reply address unless set already.
+  runuser -l "$BOX_USER" -c 'bash -s' <<'EOF'
+gh auth setup-git
+git config --global user.name >/dev/null || git config --global user.name "$(gh api user --jq '.name // .login')"
+git config --global user.email >/dev/null || git config --global user.email "$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')"
+echo "    signed in as $(gh api user --jq .login); commits by $(git config --global user.name) <$(git config --global user.email)>"
+EOF
+}
+
+# Claude Code asks two questions on the first Remote Control run (trust the folder,
+# enable Remote Control) and a background service can't answer them, so the first run
+# happens here in the foreground. The check below reads Claude Code's own state file;
+# if its layout ever changes we just do the foreground run again, which is harmless.
+already_enabled() {
+  python3 - "$BOX_HOME/.claude.json" "$WORK" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+ok = d.get("remoteDialogSeen") and d.get("projects", {}).get(sys.argv[2], {}).get("hasTrustDialogAccepted")
+sys.exit(0 if ok else 1)
+PY
+}
+
+step_first_run() {
+  if already_enabled && ! ask "Remote Control is already set up here. Run it in the foreground once more (to see the QR code)?" n; then
+    return 0
+  fi
+  say "First Remote Control run"
+  cat <<EOF
+    Claude Code asks two things the first time. Answer y to both:
+      - trust $WORK
+      - enable Remote Control
+    Then press SPACE for a QR code and scan it with your phone,
+    or open the Claude app, go to Code, and pick "$BOX_NAME".
+    Once the box shows up on your phone, press Ctrl-C here (twice if it asks)
+    and the script hands Remote Control to a background service.
+EOF
+  ask "Ready?" y || true
+  trap ':' INT
+  as_user "cd '$WORK' && '$CLAUDE_BIN' remote-control --name '$BOX_NAME' --permission-mode '$PERMISSION_MODE'" </dev/tty || true
+  trap - INT
+  already_enabled || warn "Couldn't confirm both questions were answered; if the service fails, re-run this script."
+}
+
+step_service() {
+  say "Installing remote-control.service, so Remote Control survives reboots and crashes"
+  cat >/etc/systemd/system/remote-control.service <<EOF
+[Unit]
+Description=Claude Code Remote Control ($BOX_NAME)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# Never give up: after a network outage or an expired login it retries every 30 s.
+StartLimitIntervalSec=0
+
+[Service]
+User=$BOX_USER
+Group=$BOX_USER
+WorkingDirectory=$WORK
+Environment=HOME=$BOX_HOME
+ExecStart=$CLAUDE_BIN remote-control --name "$BOX_NAME" --permission-mode $PERMISSION_MODE
+Restart=always
+RestartSec=30
+# The status line redraws several times a second; keep only errors in the journal.
+StandardOutput=null
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable remote-control.service >/dev/null 2>&1
+  systemctl restart remote-control.service
+  sleep 8
+  if systemctl is-active --quiet remote-control.service; then
+    info "running"
+  else
+    warn "remote-control.service isn't running. Last log lines:"
+    journalctl -u remote-control.service -n 15 --no-pager >&2 || true
+  fi
+}
+
+step_close_public_ssh() {
+  [ "$TAILSCALE" = yes ] && [ -n "$TS_IP" ] && [ "$LAPTOP_CLOSES_SSH" = no ] || return 0
+  say "Closing SSH on the public IP"
+  info "In a NEW terminal, check this works first:  ssh root@$TS_IP"
+  if ask "Did it work? Close SSH on the public IP now?" n; then
+    ufw delete allow OpenSSH >/dev/null
+    info "Public SSH closed. From now on: ssh root@$TS_IP"
+  else
+    info "Left open. Close it later with: ufw delete allow OpenSSH"
+  fi
+}
+
+summary() {
+  say "Done: '$BOX_NAME' is running Claude Code under Remote Control"
+  cat <<EOF
+    Phone      Claude app > Code > $BOX_NAME
+    Browser    https://claude.ai/code
+    Status     systemctl status remote-control
+    Logs       journalctl -u remote-control -f
+    Sign in    runuser -l $BOX_USER -c 'claude auth login' && systemctl restart remote-control
+    Turn off   systemctl disable --now remote-control
+EOF
+  [ -z "$TS_IP" ] || info "SSH        ssh root@$TS_IP"
+}
+
+cmd_setup() {
+  parse_setup_args "$@"
+  preflight
+  step_packages
+  step_swap
+  step_user
+  step_claude_code
+  step_workspace
+  step_tailscale
+  step_firewall
+  step_login
+  step_github
+  step_first_run
+  step_service
+  step_close_public_ssh
+  summary
+}
+
+# Run on the box by `down` just before the server is deleted.
+cmd_signout() {
+  [ "$(id -u)" -eq 0 ] || die "Run as root."
+  local user
+  user=$(systemctl show -p User --value remote-control.service 2>/dev/null || true)
+  user=${user:-agent}
+  systemctl disable --now remote-control.service >/dev/null 2>&1 || true
+  if id "$user" >/dev/null 2>&1; then
+    runuser -l "$user" -c '~/.local/bin/claude auth logout' </dev/null >/dev/null 2>&1 && info "Claude: signed out" || true
+    runuser -l "$user" -c 'gh auth logout --hostname github.com' </dev/null >/dev/null 2>&1 && info "GitHub: signed out" || true
+  fi
+  # Last, because it drops the tailnet and with it any SSH connection that runs over it.
+  if command -v tailscale >/dev/null && tailscale ip -4 >/dev/null 2>&1; then
+    info "Tailscale: logged out"
+    tailscale logout >/dev/null 2>&1 || true
+  fi
+}
+
+# ---- From your laptop: create and delete servers through the Hetzner Cloud API ----
+
+API=${HCLOUD_API:-https://api.hetzner.cloud/v1}   # overridable for testing
+
+need() {
+  local c
+  for c in "$@"; do command -v "$c" >/dev/null || die "Needs '$c' on this computer."; done
+}
+
+token() {
+  if [ -z "${HCLOUD_TOKEN:-}" ]; then
+    printf 'Hetzner API token (Console > your project > Security > API tokens, Read & Write): ' >/dev/tty
+    read -rs HCLOUD_TOKEN </dev/tty || true
+    echo >/dev/tty
+  fi
+  [ -n "$HCLOUD_TOKEN" ] || die "No Hetzner API token."
+}
+
+# hapi METHOD PATH [JSON]: one API call. Prints the response body; dies with Hetzner's message on an error.
+hapi() {
+  local args out code
+  args=(-sS -X "$1" -H "Authorization: Bearer $HCLOUD_TOKEN" -w '\n%{http_code}')
+  if [ $# -ge 3 ]; then args+=(-H 'Content-Type: application/json' --data "$3"); fi
+  out=$(curl "${args[@]}" "$API$2") || die "Couldn't reach the Hetzner API."
+  code=${out##*$'\n'}
+  out=${out%$'\n'*}
+  if [ "$code" -ge 400 ]; then
+    die "Hetzner refused $1 $2 ($code): $(jq -r '.error.message // .' <<<"$out" 2>/dev/null || echo "$out")"
+  fi
+  printf '%s\n' "$out"
+}
+
+find_server() { hapi GET "/servers?name=$1" | jq -c '.servers[0] // empty'; }
+
+made_by_us() { [ "$(jq -r '.labels["deskless"] // empty' <<<"$1")" = true ]; }
+
+default_key() {
+  local k
+  for k in ~/.ssh/id_ed25519.pub ~/.ssh/id_ecdsa.pub ~/.ssh/id_rsa.pub; do
+    if [ -f "$k" ]; then echo "$k"; return 0; fi
+  done
+  echo ~/.ssh/id_ed25519.pub
+}
+
+ssh_setup() {
+  SSH_KEY=${SSH_KEY:-$(default_key)}
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o ServerAliveInterval=30)
+  if [ -f "${SSH_KEY%.pub}" ]; then SSH_OPTS+=(-i "${SSH_KEY%.pub}"); fi
+}
+
+# The laptop's own Tailscale CLI: on PATH, or inside the macOS app.
+laptop_ts() {
+  local t
+  for t in "$(command -v tailscale || true)" /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+    if [ -n "$t" ] && [ -x "$t" ]; then echo "$t"; return 0; fi
+  done
+  return 1
+}
+
+# tailnet_ip [PEER]: this laptop's Tailscale IPv4, or a peer's; fails when the laptop isn't on a tailnet.
+tailnet_ip() {
+  local t ip
+  t=$(laptop_ts) || return 1
+  ip=$("$t" ip -4 "$@" 2>/dev/null | grep -Eo '^[0-9]+(\.[0-9]+){3}$' | head -n 1)
+  [ -n "$ip" ] && echo "$ip"
+}
+
+# Prints the first of the given hosts that answers SSH: the public IP, or the Tailscale name
+# once public SSH is closed.
+reachable() {
+  local h
+  for h in "$@"; do
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$h" true 2>/dev/null; then echo "$h"; return 0; fi
+  done
+  return 1
+}
+
+wait_for_ssh() {
+  local i
+  for i in $(seq 1 40); do
+    if reachable "$1" >/dev/null; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+# Hetzner only accepts keys it already knows, so upload ours once and reuse it after that.
+hetzner_key_id() {
+  [ -f "$SSH_KEY" ] || die "No SSH public key at $SSH_KEY. Make one with: ssh-keygen -t ed25519"
+  local fp id
+  fp=$(ssh-keygen -E md5 -lf "$SSH_KEY" | awk '{print $2}')
+  fp=${fp#MD5:}
+  id=$(hapi GET "/ssh_keys?fingerprint=$fp" | jq -r '.ssh_keys[0].id // empty')
+  if [ -z "$id" ]; then
+    id=$(hapi POST /ssh_keys "$(jq -n --arg n "deskless ${fp:0:11}" --arg k "$(cat "$SSH_KEY")" \
+      '{name: $n, public_key: $k}')" | jq -r .ssh_key.id)
+  fi
+  echo "$id"
+}
+
+cmd_up() {
+  local name='' type=${HCLOUD_TYPE:-cx23} location=${HCLOUD_LOCATION:-hel1} image=${HCLOUD_IMAGE:-ubuntu-24.04}
+  local pass=() tailscale=yes
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --no-tailscale) tailscale=no; pass+=("$1"); shift ;;
+      --tailscale) shift ;;   # the default
+      --type) type=${2:?--type needs a value}; shift 2 ;;
+      --location) location=${2:?--location needs a value}; shift 2 ;;
+      --image) image=${2:?--image needs a value}; shift 2 ;;
+      --ssh-key) SSH_KEY=${2:?--ssh-key needs a value}; shift 2 ;;
+      --permission-mode|--user) pass+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+      -*) die "Unknown option $1 (try --help)" ;;
+      *) [ -z "$name" ] || die "One name at a time."; name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Usage: ./deskless up NAME"
+  [[ $name =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || die "Name '$name': lowercase letters, digits and dashes. It becomes the server's hostname."
+  [ -f "$0" ] || die "Save the script to a file and run it from there; 'up' copies itself to the server."
+  need curl jq ssh scp ssh-keygen
+  token
+  ssh_setup
+
+  if [ "$tailscale" = yes ] && ! tailnet_ip >/dev/null; then
+    warn "This computer isn't on Tailscale, so public SSH will stay open. Install Tailscale here and sign in to close it."
+  fi
+
+  local server ip host price key_id body ts_ip
+  server=$(find_server "$name")
+  if [ -n "$server" ]; then
+    made_by_us "$server" || die "A server called '$name' already exists and deskless didn't make it. Pick another name."
+    ip=$(jq -r .public_net.ipv4.ip <<<"$server")
+    say "'$name' already exists ($ip); running setup on it again"
+  else
+    say "Creating '$name': $type in $location, $image"
+    # The server plus its public IPv4 address, in the account's own currency.
+    price=$(hapi GET /pricing | jq -r --arg t "$type" --arg l "$location" '.pricing as $p
+      | ($p.server_types[] | select(.name == $t) | .prices[] | select(.location == $l) | .price_monthly.gross | tonumber) as $s
+      | ([$p.primary_ips[] | select(.type == "ipv4") | .prices[] | select(.location == $l) | .price_monthly.gross | tonumber] | first // 0) as $ip
+      | "\($p.currency) \($s + $ip)"' | LC_ALL=C awk '{printf "%s %.2f", $1, $2}')
+    [ -z "$price" ] || info "$price a month with its IPv4 address, billed by the hour until: ./deskless down $name"
+    key_id=$(hetzner_key_id)
+    body=$(jq -n --arg n "$name" --arg t "$type" --arg i "$image" --arg l "$location" --argjson k "$key_id" \
+      '{name: $n, server_type: $t, image: $i, location: $l, ssh_keys: [$k], labels: {"deskless": "true"}}')
+    ip=$(hapi POST /servers "$body" | jq -r .server.public_net.ipv4.ip)
+    ssh-keygen -R "$ip" >/dev/null 2>&1 || true   # Hetzner reuses IPs, so a saved host key for this one is stale
+    info "IP $ip; waiting for it to boot"
+    wait_for_ssh "$ip" || die "SSH to $ip didn't answer within 3 minutes. Run './deskless up $name' again to retry."
+  fi
+  host=$(reachable "$ip" $(tailnet_ip "$name" || true) "$name") \
+    || die "Can't reach '$name' over SSH, on its public IP $ip or on Tailscale."
+  scp -q "${SSH_OPTS[@]}" "$0" "root@$host:/root/deskless"
+  if [ "$tailscale" = yes ] && [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+    ssh "${SSH_OPTS[@]}" "root@$host" 'umask 077; cat > /root/.deskless-tailscale-key' <<<"$TAILSCALE_AUTHKEY"
+  fi
+  ssh -t "${SSH_OPTS[@]}" "root@$host" \
+    "$(printf '%q ' bash /root/deskless setup --name "$name" --laptop-closes-ssh ${pass[@]+"${pass[@]}"})"
+
+  [ "$tailscale" = yes ] || return 0
+  say "Connecting from this computer over Tailscale"
+  ts_ip=$(ssh "${SSH_OPTS[@]}" "root@$host" 'tailscale ip -4 2>/dev/null | head -n 1' || true)
+  if [ -z "$ts_ip" ]; then
+    warn "The box isn't on Tailscale, so public SSH stays open. Run './deskless up $name' again to retry."
+  elif ! tailnet_ip >/dev/null; then
+    warn "This computer isn't on Tailscale, so public SSH stays open. Sign in to Tailscale here, then run './deskless up $name' again."
+  elif ! reachable "$ts_ip" >/dev/null; then
+    warn "Can't reach $ts_ip over Tailscale from here, so public SSH stays open."
+  else
+    ssh "${SSH_OPTS[@]}" "root@$ts_ip" 'ufw delete allow OpenSSH >/dev/null 2>&1 || true'
+    info "SSH works over Tailscale, so it's now closed on the public IP."
+    info "From now on: ssh root@$ts_ip"
+  fi
+}
+
+cmd_down() {
+  local name='' yes=no
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -y|--yes) yes=yes; shift ;;
+      -*) die "Unknown option $1 (try --help)" ;;
+      *) [ -z "$name" ] || die "One name at a time."; name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Usage: ./deskless down NAME   (./deskless list shows your boxes)"
+  need curl jq ssh ssh-keygen
+  token
+  ssh_setup
+
+  local server id ip host typed ts_peer h
+  server=$(find_server "$name")
+  [ -n "$server" ] || die "No server called '$name' in this Hetzner project."
+  made_by_us "$server" \
+    || die "deskless didn't make '$name', so it won't delete it. Use the Hetzner console if you mean it."
+  id=$(jq -r .id <<<"$server")
+  ip=$(jq -r .public_net.ipv4.ip <<<"$server")
+  if [ "$yes" != yes ]; then
+    { : </dev/tty; } 2>/dev/null || die "No terminal to confirm on. Pass --yes to delete without asking."
+    printf "Delete '%s' (%s)? Everything on it is gone for good. Type its name to confirm: " "$name" "$ip" >/dev/tty
+    read -r typed </dev/tty || typed=
+    [ "$typed" = "$name" ] || die "Not deleted."
+  fi
+
+  say "Signing '$name' out"
+  ts_peer=$(tailnet_ip "$name" || true)
+  if [ -f "$0" ] && host=$(reachable $ts_peer "$ip" "$name"); then
+    # The Tailscale logout at the end cuts this connection when it runs over the tailnet, so
+    # notice the drop within seconds and keep ssh's complaint about it out of the output.
+    ssh -o ServerAliveInterval=3 -o ServerAliveCountMax=2 "${SSH_OPTS[@]}" "root@$host" \
+      'bash -s -- signout' <"$0" 2>/dev/null || true
+  else
+    warn "Couldn't reach the box to sign it out of Claude, GitHub and Tailscale."
+  fi
+
+  say "Deleting the server"
+  hapi DELETE "/servers/$id" >/dev/null
+  for h in "$ip" "$name" $ts_peer; do ssh-keygen -R "$h" >/dev/null 2>&1 || true; done
+  info "'$name' is deleted, and Hetzner has stopped billing for it."
+  if [ -n "$ts_peer" ]; then
+    info "Tailscale keeps listing it as logged out until you remove it:"
+    info "https://login.tailscale.com/admin/machines"
+  fi
+}
+
+cmd_list() {
+  need curl jq
+  token
+  local rows
+  rows=$(hapi GET '/servers?label_selector=deskless' | jq -r \
+    '.servers[] | [.name, .public_net.ipv4.ip, .server_type.name, .datacenter.location.name, .status] | @tsv')
+  if [ -z "$rows" ]; then info "No deskless servers in this Hetzner project."; return 0; fi
+  { printf 'NAME\tIP\tTYPE\tLOCATION\tSTATUS\n'; printf '%s\n' "$rows"; } | column -t -s "$(printf '\t')"
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# -eq 0 ] || shift
+  case $cmd in
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
+    list) cmd_list "$@" ;;
+    setup) cmd_setup "$@" ;;
+    signout) cmd_signout "$@" ;;
+    help|-h|--help) usage ;;
+    *) die "Unknown command '$cmd' (try --help)" ;;
+  esac
+}
+
+# Everything runs from here, so a half-downloaded script does nothing.
+main "$@"
