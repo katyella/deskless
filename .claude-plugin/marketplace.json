@@ -1,0 +1,15 @@
+{
+  "name": "deskless",
+  "description": "Plugins from Katyella. deskless: your own always-on Claude Code server, used from your phone.",
+  "owner": {
+    "name": "Katyella",
+    "url": "https://github.com/katyella"
+  },
+  "plugins": [
+    {
+      "name": "deskless",
+      "source": "./",
+      "description": "Your own always-on Claude Code server on Hetzner, used from the Claude app and claude.ai/code. Sets it up, lists it and deletes it, walking you through every step."
+    }
+  ]
+}

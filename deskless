@@ -2,10 +2,14 @@
 # deskless: Claude Code on your own Hetzner server, driven from the Claude app (iOS, Android)
 # and claude.ai/code. https://github.com/katyella/deskless (MIT). Run it from your laptop:
 #
-#   export HCLOUD_TOKEN=...      # Hetzner Console > your project > Security > API tokens (Read & Write)
 #   ./deskless up mybox        # create the server and set it up (you approve a few sign-ins)
 #   ./deskless down mybox      # sign it out of Claude, GitHub and Tailscale, then delete it
 #   ./deskless list            # the boxes this script made
+#
+# The first run asks for a Hetzner API token (Hetzner Console > your project > Security > API tokens,
+# Read & Write) and offers to remember it. HCLOUD_TOKEN works too. An optional Tailscale API access
+# token (TAILSCALE_API_KEY, or ~/.config/deskless/tailscale-api-key) saves three chores: the box
+# joins your tailnet without a browser approval, its key never expires, and `down` removes it.
 #
 # Already have a server? Copy this file to it and run:  sudo bash deskless setup
 #
@@ -32,8 +36,9 @@ as_user() { runuser -l "$BOX_USER" -c "$1"; }
 
 usage() {
   cat <<'EOF'
-From your laptop (needs HCLOUD_TOKEN, an API token from your Hetzner project; set
-TAILSCALE_AUTHKEY too and the box joins your tailnet without a browser approval):
+From your laptop (asks for an API token from your Hetzner project the first time, or set
+HCLOUD_TOKEN; with TAILSCALE_API_KEY, a Tailscale access token, the box joins your tailnet
+without a browser approval, and `down` removes it from there):
   ./deskless up NAME [--type cx23] [--location hel1] [--image ubuntu-24.04]
                        [--ssh-key ~/.ssh/id_ed25519.pub] [setup options]
   ./deskless down NAME [--yes]
@@ -222,7 +227,8 @@ step_tailscale() {
   fi
   TS_IP=$(tailscale ip -4 | head -n 1)
   info "on your tailnet as $(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")') ($TS_IP)"
-  info "Turn off key expiry for this box in the Tailscale admin console, or it drops off in 180 days."
+  # `up` handles key expiry from the laptop.
+  [ "$LAPTOP_CLOSES_SSH" = yes ] || info "Turn off key expiry for this box in the Tailscale admin console, or it drops off in 180 days."
 }
 
 step_firewall() {
@@ -406,6 +412,9 @@ cmd_signout() {
 # ---- From your laptop: create and delete servers through the Hetzner Cloud API ----
 
 API=${HCLOUD_API:-https://api.hetzner.cloud/v1}   # overridable for testing
+TS_API=${TAILSCALE_API:-https://api.tailscale.com/api/v2}
+# Tokens you've asked the script to remember, one file each, readable only by you.
+CONFIG=${DESKLESS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/deskless}
 
 need() {
   local c
@@ -413,12 +422,17 @@ need() {
 }
 
 token() {
-  if [ -z "${HCLOUD_TOKEN:-}" ]; then
-    printf 'Hetzner API token (Console > your project > Security > API tokens, Read & Write): ' >/dev/tty
-    read -rs HCLOUD_TOKEN </dev/tty || true
-    echo >/dev/tty
-  fi
+  if [ -z "${HCLOUD_TOKEN:-}" ] && [ -s "$CONFIG/hetzner-token" ]; then HCLOUD_TOKEN=$(cat "$CONFIG/hetzner-token"); fi
+  [ -z "${HCLOUD_TOKEN:-}" ] || return 0
+  printf 'Hetzner API token (Console > your project > Security > API tokens, Read & Write): ' >/dev/tty
+  read -rs HCLOUD_TOKEN </dev/tty || true
+  echo >/dev/tty
   [ -n "$HCLOUD_TOKEN" ] || die "No Hetzner API token."
+  hapi GET '/servers?per_page=1' >/dev/null   # a token Hetzner refuses dies here, before it's remembered
+  if ask "Remember it in $CONFIG/hetzner-token, readable only by you?" y; then
+    (umask 077; mkdir -p "$CONFIG"; printf '%s\n' "$HCLOUD_TOKEN" >"$CONFIG/hetzner-token")
+    info "Saved. Delete that file to forget it."
+  fi
 }
 
 # hapi METHOD PATH [JSON]: one API call. Prints the response body; dies with Hetzner's message on an error.
@@ -438,6 +452,35 @@ hapi() {
 find_server() { hapi GET "/servers?name=$1" | jq -c '.servers[0] // empty'; }
 
 made_by_us() { [ "$(jq -r '.labels["deskless"] // empty' <<<"$1")" = true ]; }
+
+# The Tailscale API is optional; ts_key says whether we have an access token for it.
+ts_key() {
+  if [ -z "${TAILSCALE_API_KEY:-}" ] && [ -s "$CONFIG/tailscale-api-key" ]; then
+    TAILSCALE_API_KEY=$(cat "$CONFIG/tailscale-api-key")
+  fi
+  [ -n "${TAILSCALE_API_KEY:-}" ]
+}
+
+# tsapi METHOD PATH [JSON]: one Tailscale API call. Prints the response body; fails on an error.
+tsapi() {
+  local args=(-fsS -X "$1" -H "Authorization: Bearer $TAILSCALE_API_KEY")
+  if [ $# -ge 3 ]; then args+=(-H 'Content-Type: application/json' --data "$3"); fi
+  curl "${args[@]}" "$TS_API$2" 2>/dev/null
+}
+
+# ts_device NODE_ID [NAME TAILSCALE_IP]: the API id of the box on the tailnet. That's the device with
+# the node ID the box reported, or without one, the device with both the box's name and the address
+# this laptop knows it by. Prints nothing unless exactly one device matches.
+ts_device() {
+  tsapi GET /tailnet/-/devices | jq -r --arg node "$1" --arg n "${2:-}" --arg ip "${3:-}" '
+    [.devices[] | select(if $node != "" then .nodeId == $node else .hostname == $n and any(.addresses[]; . == $ip) end)]
+    | if length == 1 then .[0].id else empty end'
+}
+
+# The box's own Tailscale node ID, asked over SSH.
+ts_node() {
+  ssh "${SSH_OPTS[@]}" "root@$1" 'tailscale status --json 2>/dev/null | jq -r ".Self.ID // empty"' 2>/dev/null || true
+}
 
 default_key() {
   local k
@@ -556,8 +599,16 @@ cmd_up() {
   host=$(reachable "$ip" $(tailnet_ip "$name" || true) "$name") \
     || die "Can't reach '$name' over SSH, on its public IP $ip or on Tailscale."
   scp -q "${SSH_OPTS[@]}" "$0" "root@$host:/root/deskless"
-  if [ "$tailscale" = yes ] && [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
-    ssh "${SSH_OPTS[@]}" "root@$host" 'umask 077; cat > /root/.deskless-tailscale-key' <<<"$TAILSCALE_AUTHKEY"
+  local authkey=${TAILSCALE_AUTHKEY:-}
+  if [ "$tailscale" = yes ] && [ -z "$authkey" ] && ts_key \
+    && ! ssh "${SSH_OPTS[@]}" "root@$host" 'tailscale ip -4' >/dev/null 2>&1; then
+    # A single-use key that's already approved, so nobody has to click Approve.
+    authkey=$(tsapi POST /tailnet/-/keys "$(jq -n --arg d "deskless $name" '{description: $d, expirySeconds: 3600,
+      capabilities: {devices: {create: {reusable: false, ephemeral: false, preauthorized: true}}}}')" | jq -r '.key // empty' || true)
+    [ -n "$authkey" ] || warn "The Tailscale API didn't hand out an auth key, so you'll approve the box in the browser."
+  fi
+  if [ "$tailscale" = yes ] && [ -n "$authkey" ]; then
+    ssh "${SSH_OPTS[@]}" "root@$host" 'umask 077; cat > /root/.deskless-tailscale-key' <<<"$authkey"
   fi
   ssh -t "${SSH_OPTS[@]}" "root@$host" \
     "$(printf '%q ' bash /root/deskless setup --name "$name" --laptop-closes-ssh ${pass[@]+"${pass[@]}"})"
@@ -565,6 +616,13 @@ cmd_up() {
   [ "$tailscale" = yes ] || return 0
   say "Connecting from this computer over Tailscale"
   ts_ip=$(ssh "${SSH_OPTS[@]}" "root@$host" 'tailscale ip -4 2>/dev/null | head -n 1' || true)
+  local dev=''
+  if [ -n "$ts_ip" ] && ts_key; then dev=$(ts_device "$(ts_node "$host")" || true); fi
+  if [ -n "$dev" ] && tsapi POST "/device/$dev/key" '{"keyExpiryDisabled": true}' >/dev/null; then
+    info "Its Tailscale key never expires, so it stays on your tailnet."
+  elif [ -n "$ts_ip" ]; then
+    info "In the Tailscale admin console, turn off key expiry for '$name', or it drops off in 180 days."
+  fi
   if [ -z "$ts_ip" ]; then
     warn "The box isn't on Tailscale, so public SSH stays open. Run './deskless up $name' again to retry."
   elif ! tailnet_ip >/dev/null; then
@@ -592,7 +650,7 @@ cmd_down() {
   token
   ssh_setup
 
-  local server id ip host typed ts_peer h
+  local server id ip host typed ts_peer h node='' dev=''
   server=$(find_server "$name")
   [ -n "$server" ] || die "No server called '$name' in this Hetzner project."
   made_by_us "$server" \
@@ -609,6 +667,7 @@ cmd_down() {
   say "Signing '$name' out"
   ts_peer=$(tailnet_ip "$name" || true)
   if [ -f "$0" ] && host=$(reachable $ts_peer "$ip" "$name"); then
+    if ts_key; then node=$(ts_node "$host"); fi   # before it logs out and forgets
     # The Tailscale logout at the end cuts this connection when it runs over the tailnet, so
     # notice the drop within seconds and keep ssh's complaint about it out of the output.
     ssh -o ServerAliveInterval=3 -o ServerAliveCountMax=2 "${SSH_OPTS[@]}" "root@$host" \
@@ -621,9 +680,14 @@ cmd_down() {
   hapi DELETE "/servers/$id" >/dev/null
   for h in "$ip" "$name" $ts_peer; do ssh-keygen -R "$h" >/dev/null 2>&1 || true; done
   info "'$name' is deleted, and Hetzner has stopped billing for it."
-  if [ -n "$ts_peer" ]; then
+  [ -n "$node$ts_peer" ] || return 0
+  if ts_key; then dev=$(ts_device "$node" "$name" "$ts_peer" || true); fi
+  if [ -n "$dev" ] && tsapi DELETE "/device/$dev" >/dev/null; then
+    info "Removed it from your tailnet too."
+  else
     info "Tailscale keeps listing it as logged out until you remove it:"
     info "https://login.tailscale.com/admin/machines"
+    ts_key || info "(With a Tailscale API access token in TAILSCALE_API_KEY, down does that for you.)"
   fi
 }
 

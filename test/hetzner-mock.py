@@ -1,7 +1,9 @@
-"""A tiny stand-in for the Hetzner Cloud API, enough for deskless's laptop commands.
+"""A tiny stand-in for the Hetzner Cloud API and the Tailscale API, enough for deskless's laptop commands.
 
 Usage: python3 hetzner-mock.py PORT
-Accepts the token "good". Starts with one server, "other-box", that deskless didn't make.
+Hetzner (/v1) accepts the token "good" and starts with one server, "other-box", that deskless didn't make.
+Tailscale (/api/v2) accepts "tsgood". Its tailnet has testbox, an old logged-out testbox with another
+address, and a laptop. Only the first may ever be deleted.
 """
 import base64
 import hashlib
@@ -14,6 +16,9 @@ servers = {7: {"id": 7, "name": "other-box", "labels": {}, "status": "running",
                "public_net": {"ipv4": {"ip": "192.0.2.7"}},
                "server_type": {"name": "cpx22"}, "datacenter": {"location": {"name": "hel1"}}}}
 keys = []
+devices = {"501": {"id": "501", "nodeId": "nBOX", "hostname": "testbox", "addresses": ["100.64.0.42", "fd7a::42"]},
+           "502": {"id": "502", "nodeId": "nOLD", "hostname": "testbox", "addresses": ["100.64.0.99"]},
+           "503": {"id": "503", "nodeId": "nLAP", "hostname": "laptop", "addresses": ["100.64.0.1"]}}
 pricing = {"pricing": {"currency": "USD", "vat_rate": "0.000000",
                        "server_types": [{"name": "cx23", "prices": [{"location": "hel1", "price_monthly": {"gross": "6.4900000000000000"}}]}],
                        "primary_ips": [{"type": "ipv4", "prices": [{"location": "hel1", "price_monthly": {"gross": "0.6000000000000000"}}]}]}}
@@ -28,6 +33,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def authorized(self):
+        if self.path.startswith("/api/v2/"):
+            if self.headers.get("Authorization") == "Bearer tsgood":
+                return True
+            self.send(401, {"message": "API token invalid"})
+            return False
         if self.headers.get("Authorization") == "Bearer good":
             return True
         self.send(401, {"error": {"code": "unauthorized", "message": "unable to authenticate"}})
@@ -37,6 +47,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         url = urlparse(self.path)
+        if url.path == "/api/v2/tailnet/-/devices":
+            return self.send(200, {"devices": list(devices.values())})
         q = parse_qs(url.query)
         if url.path == "/v1/servers":
             found = list(servers.values())
@@ -73,6 +85,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self.authorized():
             return
+        if self.path.startswith("/api/v2/device/"):
+            return self.send(200, {}) if devices.pop(self.path.rsplit("/", 1)[1], None) else self.send(404, {"message": "not found"})
         servers.pop(int(self.path.rsplit("/", 1)[1]), None)
         self.send(200, {"action": {"status": "running"}})
 

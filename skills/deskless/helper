@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# The agent's side of the deskless skill: small commands for walking someone through `deskless`
+# without handling tokens or temp folders by hand. Run it with bash, so it works without the
+# executable bit.
+#   bash helper check                    what's ready on this computer, one line per item
+#   bash helper save hetzner|tailscale   save the token on the clipboard (or stdin, with -); never prints it
+#   bash helper up NAME [--github] [up options]   run `deskless up NAME` through drive.exp; start it in the background
+#   bash helper wait NAME                wait until something happens in that run, then print it
+#   bash helper code NAME [CODE]         hand the Claude sign-in code to the run, from the clipboard if no CODE
+#   bash helper list                     deskless list
+#   bash helper down NAME                deskless down NAME --yes; only after the person has said yes
+#   bash helper clean NAME               delete the run's folder, which holds sign-in links
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+config=${DESKLESS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/deskless}
+runs=${TMPDIR:-/tmp}/deskless-runs-$(id -u)
+hetzner_api=${HCLOUD_API:-https://api.hetzner.cloud/v1}
+tailscale_api=${TAILSCALE_API:-https://api.tailscale.com/api/v2}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# The deskless script: $DESKLESS, next to this file (a copied skill), or two folders up (the plugin).
+deskless() {
+  local c
+  for c in "${DESKLESS:-}" "$here/deskless" "$here/../../deskless"; do
+    if [ -n "$c" ] && [ -f "$c" ]; then echo "$(cd "$(dirname "$c")" && pwd)/$(basename "$c")"; return 0; fi
+  done
+  return 1
+}
+
+clipboard() {
+  if command -v pbpaste >/dev/null; then pbpaste
+  elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null; then wl-paste --no-newline
+  elif command -v xclip >/dev/null; then xclip -o -selection clipboard
+  elif command -v xsel >/dev/null; then xsel --clipboard --output
+  else die "No clipboard tool here. Pipe the token in instead: ... | bash helper save KIND -"
+  fi
+}
+
+clear_clipboard() {
+  if command -v pbcopy >/dev/null; then pbcopy </dev/null
+  elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null; then wl-copy --clear
+  elif command -v xclip >/dev/null; then printf '' | xclip -selection clipboard
+  fi 2>/dev/null || true
+}
+
+# http_code URL TOKEN: the HTTP status of a GET, or 000 when the API can't be reached.
+http_code() {
+  curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $2" "$1" 2>/dev/null || true
+}
+
+token_file() { case $1 in hetzner) echo "$config/hetzner-token" ;; tailscale) echo "$config/tailscale-api-key" ;; esac; }
+
+saved_token() {
+  local env file
+  if [ "$1" = hetzner ]; then env=${HCLOUD_TOKEN:-}; else env=${TAILSCALE_API_KEY:-}; fi
+  file=$(token_file "$1")
+  if [ -n "$env" ]; then echo "$env"; elif [ -s "$file" ]; then cat "$file"; fi
+}
+
+check_url() { if [ "$1" = hetzner ]; then echo "$hetzner_api/servers?per_page=1"; else echo "$tailscale_api/tailnet/-/devices"; fi; }
+
+# Each line: ok | missing | optional, then the item, then a hint for the agent.
+cmd_check() {
+  local t key ip code ts
+  row() { printf '%-9s %-22s %s\n' "$@"; }
+  if t=$(deskless); then row ok "deskless script" "$t"; else row missing "deskless script" "reinstall the skill"; fi
+  for t in curl jq ssh expect; do
+    if command -v "$t" >/dev/null; then row ok "$t" ""
+    elif [ "$(uname)" = Darwin ]; then row missing "$t" "brew install $t"
+    else row missing "$t" "sudo apt install -y $t"
+    fi
+  done
+  key=''
+  for t in ~/.ssh/id_ed25519.pub ~/.ssh/id_ecdsa.pub ~/.ssh/id_rsa.pub; do
+    if [ -f "$t" ]; then key=$t; break; fi
+  done
+  if [ -n "$key" ]; then row ok "SSH key" "$key"
+  else row missing "SSH key" "none yet; with the person's OK: ssh-keygen -t ed25519 -N '' -C deskless -f ~/.ssh/id_ed25519"
+  fi
+  ts=''
+  for t in "$(command -v tailscale || true)" /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+    if [ -n "$t" ] && [ -x "$t" ]; then ts=$t; break; fi
+  done
+  ip=''
+  if [ -n "$ts" ]; then ip=$("$ts" ip -4 2>/dev/null | head -n 1 || true); fi
+  if [ -n "$ip" ]; then row ok "Tailscale here" "signed in, $ip"
+  elif [ -n "$ts" ]; then row missing "Tailscale here" "installed but signed out: open Tailscale and sign in"
+  else row missing "Tailscale here" "install from https://tailscale.com/download and sign in"
+  fi
+  t=$(saved_token hetzner)
+  if [ -z "$t" ]; then row missing "Hetzner token" "not saved yet"
+  else
+    code=$(http_code "$(check_url hetzner)" "$t")
+    case $code in
+      200) row ok "Hetzner token" "saved, and Hetzner accepts it" ;;
+      401|403) row missing "Hetzner token" "saved, but Hetzner refuses it ($code): make a new one" ;;
+      *) row missing "Hetzner token" "saved, but couldn't reach Hetzner to check it (HTTP $code)" ;;
+    esac
+  fi
+  t=$(saved_token tailscale)
+  if [ -z "$t" ]; then row optional "Tailscale API token" "not saved: no auto-approve, key-expiry or cleanup help"
+  else
+    code=$(http_code "$(check_url tailscale)" "$t")
+    case $code in
+      200) row ok "Tailscale API token" "saved, and Tailscale accepts it" ;;
+      *) row optional "Tailscale API token" "saved, but Tailscale refuses it (HTTP $code); it may have expired" ;;
+    esac
+  fi
+}
+
+cmd_save() {
+  local kind=${1:-} from=${2:-clipboard} value pattern file code
+  case $kind in
+    hetzner) pattern='^[A-Za-z0-9]{32,128}$' ;;
+    tailscale) pattern='^tskey-api-[A-Za-z0-9_-]+$' ;;
+    *) die "save hetzner|tailscale [-]" ;;
+  esac
+  if [ "$from" = - ]; then value=$(cat); else value=$(clipboard); fi
+  value=$(printf '%s' "$value" | tr -d '[:space:]')
+  [[ $value =~ $pattern ]] \
+    || die "That doesn't look like a $kind token (got ${#value} characters). Copy the token itself and try again."
+  code=$(http_code "$(check_url "$kind")" "$value")
+  [ "$code" = 200 ] || die "It looks right, but $kind refused it (HTTP $code). Make a new one and copy that."
+  file=$(token_file "$kind")
+  (umask 077; mkdir -p "$config"; printf '%s\n' "$value" >"$file")
+  [ "$from" = - ] || clear_clipboard
+  echo "saved: $kind token in $file, readable only by you; checked that $kind accepts it"
+}
+
+running() { [ -s "$1/pid" ] && kill -0 "$(cat "$1/pid")" 2>/dev/null; }
+
+valid_name() { [[ ${1:-} =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "Name '${1:-}': lowercase letters, digits and dashes."; }
+
+cmd_up() {
+  valid_name "${1:-}"
+  local name=$1 dir github=0 args=() a d
+  shift
+  for a in "$@"; do
+    if [ "$a" = --github ]; then github=1; else args+=("$a"); fi
+  done
+  d=$(deskless) || die "Can't find the deskless script; reinstall the skill."
+  command -v expect >/dev/null || die "Needs expect: brew install expect, or sudo apt install -y expect"
+  dir=$runs/$name
+  if running "$dir"; then die "A run for '$name' is already going. Use: bash helper wait $name"; fi
+  rm -rf "$dir"
+  (umask 077; mkdir -p "$dir")
+  chmod 700 "$runs"
+  echo $$ >"$dir/pid"
+  GITHUB=$github DESKLESS=$d exec expect -f "$here/drive.exp" "$name" "$dir" ${args[@]+"${args[@]}"}
+}
+
+# Everything that has happened in a run so far, oldest first, one event per line.
+events() {
+  local dir=$1 log
+  log=$(LC_ALL=C sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s/\r//g' "$dir/up.log" 2>/dev/null || true)
+  LC_ALL=C awk '
+    /^==> / { sub(/^==> /, ""); print "step: " $0; next }
+    /^!!  / { sub(/^!!  /, ""); print "warning: " $0; next }
+    /a month with its IPv4 address/ { sub(/^ +/, ""); print "price: " $0; next }
+    /From now on: ssh root@/ { sub(/.*From now on: /, ""); print "ssh: " $0; next }
+    /stays on your tailnet|turn off key expiry for/ { sub(/^ +/, ""); print "tailscale: " $0; next }
+  ' <<<"$log"
+  [ ! -s "$dir/ts_url" ] || echo "approve-tailscale: $(cat "$dir/ts_url")"
+  [ ! -s "$dir/claude_url" ] || echo "claude-sign-in: $(cat "$dir/claude_url")"
+  [ ! -e "$dir/claude_code" ] || echo "claude-code-received"
+  [ ! -s "$dir/gh_code" ] || echo "github-code: $(cat "$dir/gh_code")"
+  [ ! -s "$dir/env_url" ] || echo "connected: $(cat "$dir/env_url")"
+  if [ -s "$dir/exit" ]; then
+    if [ "$(cat "$dir/exit")" = 0 ]; then echo "finished: ok"; else echo "finished: failed (exit $(cat "$dir/exit"))"; fi
+  fi
+}
+
+last_lines() {
+  echo "last lines of the log:"
+  LC_ALL=C sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s/\x1b\\][^\x07]*\x07//g; s/\r//g' "$1/up.log" 2>/dev/null \
+    | grep -v '^[[:space:]]*$' | tail -n 15 | sed 's/^/  /'
+}
+
+# Prints only what's new since the last wait, so each call is something to tell the person.
+cmd_wait() {
+  valid_name "${1:-}"
+  local dir=$runs/$1 seen new deadline=$((SECONDS + ${2:-540}))
+  # `up` may have only just been started in the background.
+  while [ ! -s "$dir/pid" ] && [ $SECONDS -lt 15 ]; do sleep 1; done
+  [ -d "$dir" ] || die "No run for '$1'. Start one with: bash helper up $1"
+  seen=$dir/.seen
+  touch "$seen"
+  while :; do
+    new=$(events "$dir" | grep -vxF -f "$seen" || true)
+    if [ -n "$new" ]; then
+      printf '%s\n' "$new" | tee -a "$seen"
+      case $new in *"finished: failed"*) last_lines "$dir" ;; esac
+      return 0
+    fi
+    if [ ! -e "$dir/exit" ] && ! running "$dir"; then echo "stopped: the run ended before it finished"; last_lines "$dir"; return 0; fi
+    if [ -e "$dir/exit" ]; then echo "finished: nothing new"; return 0; fi
+    if [ $SECONDS -ge $deadline ]; then echo "still working"; return 0; fi
+    sleep 1
+  done
+}
+
+cmd_code() {
+  valid_name "${1:-}"
+  local dir=$runs/$1 value
+  [ -s "$dir/claude_url" ] || die "The run for '$1' isn't waiting for a Claude code."
+  [ ! -e "$dir/claude_code" ] || die "The run already has a code. If sign-in failed, start over with: bash helper up $1"
+  if [ $# -ge 2 ]; then value=$2; else value=$(clipboard); fi
+  value=$(printf '%s' "$value" | tr -d '[:space:]')
+  [ ${#value} -ge 20 ] || die "That's too short to be the code from the Claude page (${#value} characters). Copy it again."
+  (umask 077; printf '%s\n' "$value" >"$dir/claude_code")
+  [ $# -ge 2 ] || clear_clipboard
+  echo "handed the code to the run"
+}
+
+cmd_clean() {
+  valid_name "${1:-}"
+  if running "$runs/$1"; then die "The run for '$1' is still going."; fi
+  rm -rf "${runs:?}/$1"
+  echo "removed the run folder for '$1'"
+}
+
+main() {
+  local cmd=${1:-help} d
+  [ $# -eq 0 ] || shift
+  case $cmd in
+    check) cmd_check ;;
+    save) cmd_save "$@" ;;
+    up) cmd_up "$@" ;;
+    wait) cmd_wait "$@" ;;
+    code) cmd_code "$@" ;;
+    list) d=$(deskless) || die "Can't find the deskless script."; exec bash "$d" list ;;
+    down) valid_name "${1:-}"; d=$(deskless) || die "Can't find the deskless script."; exec bash "$d" down "$1" --yes </dev/null ;;
+    clean) cmd_clean "$@" ;;
+    *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  esac
+}
+
+main "$@"

@@ -1,7 +1,7 @@
 #!/usr/bin/expect -f
 # Drives `deskless up NAME` for an agent: answers the script's own prompts and hands everything
 # that needs a person to files in DIR, one at a time.
-#   HCLOUD_TOKEN=... [GITHUB=1] expect -f drive.exp NAME DIR [up options]
+#   [GITHUB=1] expect -f drive.exp NAME DIR [up options]      (the skill runs it through `helper up`)
 #   DIR/ts_url       a Tailscale link for the person to approve
 #   DIR/claude_url   a Claude sign-in link; write the code the page shows to DIR/claude_code
 #   DIR/gh_code      a one-time code for https://github.com/login/device (only with GITHUB=1)
@@ -17,10 +17,10 @@ set env(LC_ALL) en_US.UTF-8
 set here [file dirname [file normalize [info script]]]
 set deskless ""
 foreach candidate [list [expr {[info exists env(DESKLESS)] ? $env(DESKLESS) : ""}] $here/deskless $here/../../deskless] {
-  if {$candidate ne "" && [file executable $candidate]} { set deskless $candidate; break }
+  if {$candidate ne "" && [file isfile $candidate]} { set deskless $candidate; break }
 }
 if {$deskless eq ""} { puts stderr "Can't find the deskless script; set DESKLESS"; exit 2 }
-spawn $deskless up $name {*}[lrange $argv 2 end]
+spawn bash $deskless up $name {*}[lrange $argv 2 end]
 # A wide terminal, so long sign-in links are never wrapped.
 catch {exec stty rows 50 columns 400 < $spawn_out(slave,name)}
 set got_claude 0

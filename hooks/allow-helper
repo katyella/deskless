@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# PreToolUse hook: lets the deskless skill's read-only helper commands run without a permission
+# prompt on every turn. A skill's allowed-tools only last for the turn that loads it, and setup
+# takes several turns. The hook approves a command only when all of it is one of these:
+#   bash <this plugin>/skills/deskless/helper check | list | wait NAME [SECONDS] | clean NAME
+#                                               | save hetzner|tailscale | code NAME ['CODE']
+# Anything else, including `up` (which rents a server) and `down` (which deletes one), and any
+# command with more on the line, gets no answer here and goes through the normal permission flow.
+command -v jq >/dev/null || exit 0
+cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null) || exit 0
+prefix="bash ${CLAUDE_PLUGIN_ROOT:?}/skills/deskless/helper "
+[[ $cmd == "$prefix"* ]] || exit 0
+rest=${cmd#"$prefix"}
+name='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+[[ $rest =~ ^(check|list|wait\ $name(\ [0-9]{1,4})?|clean\ $name|save\ (hetzner|tailscale)|code\ $name(\ \'[A-Za-z0-9#_.~-]+\')?)$ ]] || exit 0
+printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"deskless helper: read-only step"}}'
