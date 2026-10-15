@@ -132,9 +132,29 @@ Then run `bash ${CLAUDE_SKILL_DIR}/helper wait NAME` in the foreground, with a 1
 >
 > Try asking it: *"Write a small Python script that tells me the weather in Berlin, and run it."*
 >
-> It keeps running while this computer is off. To delete it later, just ask me to delete NAME, and the billing stops when it's gone.
+> Ask it for anything there, or ask me here and I'll start it on NAME for you to watch. It keeps running while this computer is off. To delete it later, just ask me to delete NAME, and the billing stops when it's gone.
 
 Add the SSH line from `ssh:` for later. If `tailscale:` asked them to turn off key expiry, add that with the link https://login.tailscale.com/admin/machines. Then run `helper clean NAME`, because the run folder holds the sign-in link.
+
+## Work on the box happens in the app
+
+Once the box is ready, anything they want built, run or changed on it is a job for the box's own Claude, which they watch and answer in the Claude app (**Code**) or at https://claude.ai/code.
+
+When they ask you for something on the box, start it there as a new session:
+
+```bash
+bash ${CLAUDE_SKILL_DIR}/helper session NAME 'TITLE' <<'EOF'
+The first message, written the way they'd say it to the box's Claude.
+EOF
+```
+
+The title is what they'll see in the app: two to four plain words, such as `kanban board`. Claude Code asks permission before this step, and that's expected. Starting a session takes up to a minute. Then say:
+
+> 👉 **It's in your app now:** open **Code** in the Claude app and tap **TITLE**. You can watch it work and reply to it there.
+
+- Never do the work yourself over SSH. Never start Claude on the box any other way, such as `claude -p`, because they can't see or answer those sessions.
+- If `session` fails, give them the first message to paste into a new **NAME** session in the app instead.
+- Use SSH only to fix setup, as in **When something goes wrong**.
 
 ## Their boxes
 

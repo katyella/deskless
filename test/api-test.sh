@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs deskless's laptop commands (up, down, list) against a local mock of the Hetzner and Tailscale
+# Runs deskless's laptop commands (up, down, list, session) against a local mock of the Hetzner and Tailscale
 # APIs. Nothing real is created. Stand-ins for ssh and tailscale go first on PATH: no box ever answers
 # SSH, and this "laptop" is on a tailnet where testbox is 100.64.0.42.
 #   bash test/api-test.sh
@@ -50,6 +50,22 @@ cb up testbox >/dev/null 2>&1
 check "down removes it from Tailscale" 0 "Removed it from your tailnet"     -- env TAILSCALE_API_KEY=tsgood "$work/deskless" down testbox --yes
 check "only that device is gone"       0 "ids: 502 503."                    -- devices
 check "list is empty again"            0 "No deskless servers"              -- cb list
+
+# session: a stand-in ssh that answers like a reachable box and shows what start-session would get.
+mkdir "$work/okbin"
+cat > "$work/okbin/ssh" <<'EOF'
+#!/usr/bin/env bash
+for a; do last=$a; done
+[ "$last" != true ] || exit 0
+eval "set -- $last"
+echo "box got: title=[$5] message=[$(printf '%s' "$6" | base64 -d)]"
+EOF
+chmod +x "$work/okbin/ssh"
+check "session checks the title"       1 "Keep the title"                   -- cb session testbox 'a/b'
+check "session needs a message"        1 "needs a first message"            -- cb session testbox hello
+check "session, box unreachable"       1 "Can't reach 'testbox'"            -- sh -c "echo hi | '$work/deskless' session testbox hello"
+check "session sends title and message" 0 "box got: title=[kanban board] message=[Build it, it's \"done\" \$5]" \
+  -- env PATH="$work/okbin:$PATH" sh -c "printf '%s' 'Build it, it'\\''s \"done\" \$5' | '$work/deskless' session testbox 'kanban board'"
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

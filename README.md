@@ -12,16 +12,19 @@ claude          # then say: "set me up a deskless box"
 ```
 
 It checks what you have and helps with what's missing, one step at a time. It creates the box
-and hands you each sign-in. Later, ask it to list your boxes or delete one. More in
+and hands you each sign-in. Later, ask it to list your boxes or delete one, or to start work on
+a box: it starts a session there that you watch and answer in the Claude app. More in
 [Let Claude Code do it](#let-claude-code-do-it).
 
 **The script on its own:**
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/katyella/deskless/v1.1/deskless && chmod +x deskless
+curl -fsSLO https://raw.githubusercontent.com/katyella/deskless/v1.2/deskless && chmod +x deskless
 ./deskless up mybox         # create the server and set it up; asks for your Hetzner token once
 ./deskless down mybox       # sign it out of everything and delete it
 ./deskless list             # the boxes this script made
+echo 'Build a small to-do web app' | ./deskless session mybox 'todo app'
+                            # start a session on the box; it shows up in the Claude app
 ```
 
 The box runs [Claude Code Remote Control](https://code.claude.com/docs/en/remote-control) as a
@@ -93,15 +96,15 @@ Start a new session and ask in your own words, such as "I want Claude Code on my
 - lists your boxes, and deletes one after you confirm.
 
 The plugin's hook lets the skill's read-only steps (`check`, `wait`, `list` and so on) run
-without a permission prompt. Creating and deleting a box always asks. The hook and the helper
+without a permission prompt. Creating and deleting a box, and starting a session on it, always ask. The hook and the helper
 behind it are in `hooks/` and `skills/deskless/`.
 
 The skill without the plugin, for Claude Code or another agent that reads `SKILL.md`:
 
 ```bash
 mkdir -p ~/.claude/skills/deskless && cd ~/.claude/skills/deskless && for f in SKILL.md helper drive.exp; do
-  curl -fsSLO "https://raw.githubusercontent.com/katyella/deskless/v1.1/skills/deskless/$f"; done &&
-  curl -fsSLO https://raw.githubusercontent.com/katyella/deskless/v1.1/deskless
+  curl -fsSLO "https://raw.githubusercontent.com/katyella/deskless/v1.2/skills/deskless/$f"; done &&
+  curl -fsSLO https://raw.githubusercontent.com/katyella/deskless/v1.2/deskless
 ```
 
 ## What Claude can and can't do on the box

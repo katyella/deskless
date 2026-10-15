@@ -5,6 +5,7 @@
 #   ./deskless up mybox        # create the server and set it up (you approve a few sign-ins)
 #   ./deskless down mybox      # sign it out of Claude, GitHub and Tailscale, then delete it
 #   ./deskless list            # the boxes this script made
+#   ./deskless session mybox 'todo app' < prompt.txt   # start a session there that shows up in the app
 #
 # The first run asks for a Hetzner API token (Hetzner Console > your project > Security > API tokens,
 # Read & Write) and offers to remember it. HCLOUD_TOKEN works too. An optional Tailscale API access
@@ -43,6 +44,9 @@ without a browser approval, and `down` removes it from there):
                        [--ssh-key ~/.ssh/id_ed25519.pub] [setup options]
   ./deskless down NAME [--yes]
   ./deskless list
+  ./deskless session NAME 'TITLE' < prompt.txt
+                     start a Claude Code session on the box with that first message; it shows
+                     up in the Claude app as TITLE, and keeps running there
 
 On a server you already have, as root:
   bash deskless setup [--name NAME] [setup options]
@@ -409,6 +413,89 @@ cmd_signout() {
   fi
 }
 
+# Marks Claude Code's first-run screens (theme, security notes, the fullscreen offer) as seen for
+# USER, so a session started in tmux goes straight to its first message. Writes only what's missing.
+seen_first_run() {
+  runuser -l "$1" -c "python3 - '$2'" <<'PY' || true
+import json, os, sys
+home = os.path.expanduser("~")
+def edit(path, change):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        d = {}
+    if change(d):
+        with open(path + ".deskless", "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(path + ".deskless", path)
+def state(d):
+    if d.get("hasCompletedOnboarding") and d.get("fullscreenUpsellSeenCount", 0) >= 3:
+        return False
+    d.update(hasCompletedOnboarding=True, fullscreenUpsellSeenCount=3)
+    d.setdefault("lastOnboardingVersion", sys.argv[1])
+    return True
+def settings(d):
+    if "theme" in d:
+        return False
+    d["theme"] = "dark"
+    return True
+edit(home + "/.claude.json", state)
+edit(home + "/.claude/settings.json", settings)
+PY
+}
+
+# Run on the box by `session`, with the title and the first message (base64). Starts an interactive
+# Claude Code session with Remote Control on, in tmux, so it shows up in the Claude app and can be
+# picked up there.
+cmd_start_session() {
+  [ "$(id -u)" -eq 0 ] || die "Run as root."
+  local title=${1:?} prompt user home work mode dir sess base n=2 i screen url='' calm=0
+  prompt=$(printf '%s' "${2:?}" | base64 -d)
+  user=$(systemctl show -p User --value remote-control.service 2>/dev/null || true)
+  [ -n "$user" ] || die "Remote Control isn't set up on this box. Run setup first."
+  home=$(getent passwd "$user" | cut -d: -f6)
+  work=$(systemctl show -p WorkingDirectory --value remote-control.service)
+  mode=$(systemctl show -p ExecStart --value remote-control.service \
+    | grep -Eo -- '--permission-mode [A-Za-z]+' | head -n 1 | cut -d' ' -f2 || true)
+  # Setup installs tmux, but it may have been removed since.
+  if ! command -v tmux >/dev/null; then
+    info "Installing tmux, which keeps the session running after SSH disconnects"
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get -yq -o DPkg::Lock::Timeout=120 install tmux >/dev/null
+  fi
+  # tmux session names can't hold dots or colons.
+  base=$(printf '%s' "$title" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-' | cut -c1-40)
+  base=${base:-session}
+  sess=$base
+  while runuser -l "$user" -c "tmux has-session -t '$sess'" 2>/dev/null; do sess=$base-$n; n=$((n + 1)); done
+  # The message goes through a file, never through a command line or shell quoting.
+  dir=$home/.cache/deskless
+  install -d -o "$user" -g "$(id -gn "$user")" -m 700 "$dir"
+  (umask 077; printf '%s' "$prompt" >"$dir/$sess.prompt")
+  printf 'cd %q || exit 1\np=$(cat %q) && rm -f %q\nexec %q "$p" --remote-control %q --permission-mode %q\n' \
+    "$work" "$dir/$sess.prompt" "$dir/$sess.prompt" "$home/.local/bin/claude" "$title" "${mode:-default}" \
+    >"$dir/$sess.sh"
+  chown "$user" "$dir/$sess.prompt" "$dir/$sess.sh"
+  seen_first_run "$user" "$(runuser -l "$user" -c "$home/.local/bin/claude --version" 2>/dev/null | cut -d' ' -f1)"
+  runuser -l "$user" -c "tmux new-session -d -s '$sess' -x 250 -y 50 'bash $dir/$sess.sh'"
+  for i in $(seq 1 90); do
+    sleep 1
+    screen=$(runuser -l "$user" -c "tmux capture-pane -p -J -t '$sess'" 2>/dev/null) \
+      || die "The session ended as soon as it started. Try it by hand: runuser -l $user, then claude"
+    [ -n "$url" ] || url=$(grep -Eo 'https://claude\.ai/code/session_[A-Za-z0-9_]+' <<<"$screen" | head -n 1 || true)
+    case $screen in
+      *"Choose the text style"*|*"Press Enter to continue"*|*"Do you trust the files in this folder"*)
+        calm=0; runuser -l "$user" -c "tmux send-keys -t '$sess' Enter" ;;
+      *"fullscreen renderer"*"Esc to cancel"*)
+        # "Not now". Escape would also cancel the first message.
+        calm=0; runuser -l "$user" -c "tmux send-keys -t '$sess' Down Enter" ;;
+      *) if [ -n "$url" ]; then calm=$((calm + 1)); [ $calm -lt 3 ] || break; fi ;;
+    esac
+  done
+  [ -n "$url" ] || die "The session didn't connect within a minute and a half. Look at it with: runuser -l $user -c 'tmux attach -t $sess'"
+  info "It's in the Claude app now: Code, then '$title'. Or open $url"
+  info "To watch it here: runuser -l $user -c 'tmux attach -t $sess', then Ctrl-B D to leave it running."
+}
+
 # ---- From your laptop: create and delete servers through the Hetzner Cloud API ----
 
 API=${HCLOUD_API:-https://api.hetzner.cloud/v1}   # overridable for testing
@@ -701,6 +788,33 @@ cmd_list() {
   { printf 'NAME\tIP\tTYPE\tLOCATION\tSTATUS\n'; printf '%s\n' "$rows"; } | column -t -s "$(printf '\t')"
 }
 
+# Starts a Claude Code session on the box with the first message from stdin. It shows up in the
+# Claude app, so the person can watch and answer it there, and keeps running on the box.
+cmd_session() {
+  [ $# -eq 2 ] || die "Usage: ./deskless session NAME 'TITLE' < prompt.txt"
+  local name=$1 title=$2 prompt ts_peer ip='' server host
+  case $title in ''|*[!A-Za-z0-9\ ._-]*) die "Keep the title to letters, digits, spaces, dots and dashes." ;; esac
+  [ ${#title} -le 60 ] || die "Keep the title to 60 characters."
+  [ -f "$0" ] || die "Run deskless from a file for this, not through a pipe."
+  if [ -t 0 ]; then info "Type the first message for the session, then press Ctrl-D:"; fi
+  prompt=$(cat)
+  [ -n "${prompt//[[:space:]]/}" ] || die "The session needs a first message."
+  need ssh base64
+  ssh_setup
+  ts_peer=$(tailnet_ip "$name" || true)
+  if [ -z "$ts_peer" ]; then
+    need curl jq
+    token
+    server=$(find_server "$name")
+    [ -n "$server" ] || die "No server called '$name' in this Hetzner project."
+    ip=$(jq -r .public_net.ipv4.ip <<<"$server")
+  fi
+  host=$(reachable $ts_peer $ip "$name") || die "Can't reach '$name' over SSH."
+  say "Starting '$title' on $name"
+  ssh "${SSH_OPTS[@]}" "root@$host" \
+    "bash -s -- start-session $(printf '%q' "$title") $(printf '%s' "$prompt" | base64 | tr -d '\n')" <"$0"
+}
+
 main() {
   local cmd=${1:-help}
   [ $# -eq 0 ] || shift
@@ -708,6 +822,8 @@ main() {
     up) cmd_up "$@" ;;
     down) cmd_down "$@" ;;
     list) cmd_list "$@" ;;
+    session) cmd_session "$@" ;;
+    start-session) cmd_start_session "$@" ;;
     setup) cmd_setup "$@" ;;
     signout) cmd_signout "$@" ;;
     help|-h|--help) usage ;;
