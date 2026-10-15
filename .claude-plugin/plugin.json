@@ -1,6 +1,6 @@
 {
   "name": "deskless",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Your own always-on Claude Code server on Hetzner, used from the Claude app and claude.ai/code. Sets it up, lists it and deletes it, walking you through every step.",
   "author": {
     "name": "Katyella",

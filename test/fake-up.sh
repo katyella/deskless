@@ -19,8 +19,9 @@ read -r gh
 if [ "$gh" = y ]; then
   printf '? Authenticate Git with your GitHub credentials? (Y/n) \033[6n'
   read -r _
-  echo "! First copy your one-time code: ABCD-1234"
-  printf 'Press Enter to open https://github.com/login/device in your browser... '
+  # Exactly as gh prints them in a terminal with colours.
+  printf '\033[0;33m!\033[0m First copy your one-time code: \033[0;1;39mABCD-1234\033[0m\r\n'
+  printf '\033[0;1;39mPress Enter\033[0m to open github.com in your browser... '
   read -r _
 fi
 say "First Remote Control run"

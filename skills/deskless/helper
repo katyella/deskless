@@ -153,7 +153,9 @@ cmd_up() {
 
 # Everything that has happened in a run so far, oldest first, one event per line.
 events() {
-  local dir=$1 log
+  local dir=$1 log status=''
+  # The exit status first: drive.exp writes it after the log's last line, so the log read next is complete.
+  [ ! -s "$dir/exit" ] || status=$(cat "$dir/exit")
   log=$(LC_ALL=C sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s/\r//g' "$dir/up.log" 2>/dev/null || true)
   LC_ALL=C awk '
     /^==> / { sub(/^==> /, ""); print "step: " $0; next }
@@ -167,8 +169,8 @@ events() {
   [ ! -e "$dir/claude_code" ] || echo "claude-code-received"
   [ ! -s "$dir/gh_code" ] || echo "github-code: $(cat "$dir/gh_code")"
   [ ! -s "$dir/env_url" ] || echo "connected: $(cat "$dir/env_url")"
-  if [ -s "$dir/exit" ]; then
-    if [ "$(cat "$dir/exit")" = 0 ]; then echo "finished: ok"; else echo "finished: failed (exit $(cat "$dir/exit"))"; fi
+  if [ -n "$status" ]; then
+    if [ "$status" = 0 ]; then echo "finished: ok"; else echo "finished: failed (exit $status)"; fi
   fi
 }
 
@@ -181,13 +183,15 @@ last_lines() {
 # Prints only what's new since the last wait, so each call is something to tell the person.
 cmd_wait() {
   valid_name "${1:-}"
-  local dir=$runs/$1 seen new deadline=$((SECONDS + ${2:-540}))
+  local dir=$runs/$1 seen new ended deadline=$((SECONDS + ${2:-540}))
   # `up` may have only just been started in the background.
   while [ ! -s "$dir/pid" ] && [ $SECONDS -lt 15 ]; do sleep 1; done
   [ -d "$dir" ] || die "No run for '$1'. Start one with: bash helper up $1"
   seen=$dir/.seen
   touch "$seen"
   while :; do
+    # Whether it had ended before the events were read, so that read includes the end.
+    ended=0; [ ! -e "$dir/exit" ] || ended=1
     new=$(events "$dir" | grep -vxF -f "$seen" || true)
     if [ -n "$new" ]; then
       printf '%s\n' "$new" | tee -a "$seen"
@@ -195,7 +199,7 @@ cmd_wait() {
       return 0
     fi
     if [ ! -e "$dir/exit" ] && ! running "$dir"; then echo "stopped: the run ended before it finished"; last_lines "$dir"; return 0; fi
-    if [ -e "$dir/exit" ]; then echo "finished: nothing new"; return 0; fi
+    if [ $ended = 1 ]; then echo "finished: nothing new"; return 0; fi
     if [ $SECONDS -ge $deadline ]; then echo "still working"; return 0; fi
     sleep 1
   done

@@ -44,8 +44,9 @@ expect {
   -re {Authenticate Git with your GitHub credentials\?.*?\x1b\[6n} {
     send "\033\[50;400R"; after 500; send "Y\r"; exp_continue
   }
-  -re {one-time code: ([A-Z0-9]{4}-[A-Z0-9]{4})} { save "$dir/gh_code" $expect_out(1,string); exp_continue }
-  -re {Press Enter to open [^\r\n]*} { send "\r"; exp_continue }
+  # gh colours its code and "Press Enter" when the terminal has colours, so allow escapes around them.
+  -re {one-time code: (?:\x1b\[[0-9;]*m)*([A-Z0-9]{4}-[A-Z0-9]{4})} { save "$dir/gh_code" $expect_out(1,string); exp_continue }
+  -re {Press Enter(?:\x1b\[[0-9;]*m)* to open [^\r\n]*} { send "\r"; exp_continue }
   -re {Run it in the foreground once more[^\r\n]*\[y/N\]} { send "n\r"; exp_continue }
   -re {Ready\? \[Y/n\]} { send "\r"; exp_continue }
   -re {Trust /home/[^\r\n]*\?} { after 500; send "y\r"; exp_continue }
@@ -63,5 +64,7 @@ expect {
   eof
 }
 catch wait result
+# Close the log first, so whoever sees DIR/exit also sees the log's last lines.
+log_file
 save "$dir/exit" [lindex $result 3]
 exit [lindex $result 3]
